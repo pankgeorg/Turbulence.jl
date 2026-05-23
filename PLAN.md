@@ -167,10 +167,10 @@ it does the same physics).
 
 ## Milestones
 
-| # | Goal                                              | Done when                                              |
-|---|---------------------------------------------------|--------------------------------------------------------|
-| 1 | Smagorinsky working on Taylor–Green               | Layer 1 test passes                                    |
-| 2 | Smagorinsky + WALE pass channel395 vs OpenFOAM    | Layer 2 ±5% on u⁺                                      |
-| 3 | SA implemented + channel395 RANS check            | Layer 2 ±5%                                            |
-| 4 | k–ω SST implemented + channel395 + backstep       | Layer 2 + Layer 3 pass                                 |
-| 5 | Public release (rename if needed, drop "private") | docs + version 0.1.0                                   |
+| # | Goal                                              | Done when                                              | Status |
+|---|---------------------------------------------------|--------------------------------------------------------|--------|
+| 1 | Smagorinsky working on Taylor–Green               | Layer 1 test passes                                    | ✅     |
+| 2 | Smagorinsky + WALE pass channel395 vs OpenFOAM    | Layer 2 ±5% on u⁺                                      | Smag ✅ (RMS 0.028), WALE implemented + L1 tests; channel395 WALE run pending |
+| 3 | SA implemented + channel395 RANS check            | Layer 2 ±5%                                            | ⛔     |
+| 4 | k–ω SST implemented + channel395 + backstep       | Layer 2 + Layer 3 pass                                 | ⛔     |
+| 5 | Public release (rename if needed, drop "private") | docs + version 0.1.0                                   | ⛔     |

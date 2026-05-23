@@ -88,4 +88,56 @@ using StaticArrays
         @test maximum(ν_after) > maximum(ν_before)
     end
 
+    @testset "WALE: still water → zero ν_t" begin
+        dims = (16, 16, 16)
+        model = WALE(dims; Cw=0.5f0, ν₀=1f-5)
+        u = zeros(Float32, (dims .+ 2)..., 3)
+        update_νt!(model, u)
+        for I in WaterLily.inside(model.ν)
+            @test model.ν[I] ≈ model.ν₀
+        end
+    end
+
+    @testset "WALE: pure shear → near-zero ν_t" begin
+        # WALE's defining property: in pure shear (Sᵈ = 0 by construction)
+        # the eddy viscosity is exactly zero — the wall-asymptotic feature.
+        # In a discrete grid we expect WALE ≪ Smagorinsky on a linear
+        # shear profile.
+        dims = (32, 32, 8)
+        γ = 0.1f0
+        u = zeros(Float32, (dims .+ 2)..., 3)
+        for I in CartesianIndices((1:dims[1]+2, 1:dims[2]+2, 1:dims[3]+2))
+            y = I.I[2] - 1.5f0
+            u[I, 1] = γ * y
+        end
+
+        wale = WALE(dims; Cw=0.5f0, ν₀=0f0)
+        smag = Smagorinsky(dims; Cs=0.17f0, ν₀=0f0)
+        update_νt!(wale, u)
+        update_νt!(smag, u)
+
+        I = CartesianIndex(16, 16, 4)
+        @test smag.ν[I] > 1e-5
+        # WALE in exact pure shear is 0; we allow some slack for the
+        # discrete stencil but expect ≪ Smagorinsky.
+        @test wale.ν[I] < 0.01 * smag.ν[I]
+    end
+
+    @testset "WALE wiring through Flow + udf" begin
+        dims = (32, 32, 8)
+        uBC = (1f0, 0f0, 0f0)
+        model = WALE(dims; Cw=0.5f0, ν₀=1f-4)
+        flow = WaterLily.Flow(dims, uBC; T=Float32, ν=model.ν)
+        for I in CartesianIndices(flow.u)
+            y = I.I[2] - 1.5f0
+            if I.I[end] == 1
+                flow.u[I] = 0.05f0 * y
+            end
+        end
+        model(flow, 0.0)
+        for I in WaterLily.inside(model.ν)
+            @test model.ν[I] >= model.ν₀ - 1f-7
+        end
+    end
+
 end
