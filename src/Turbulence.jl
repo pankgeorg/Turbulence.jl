@@ -55,17 +55,31 @@ end
 
 """
     update_νt!(model::Smagorinsky, u)
+    update_νt!(model::Smagorinsky, u, ν₀_field::AbstractArray)
 
 Recompute the total effective viscosity in `model.ν` from velocity
 field `u`. Cell-centered values only — ghost cells left at `ν₀`.
+
+If a per-cell `ν₀_field` is supplied (e.g. the per-cell molecular
+viscosity `vof.ν = μ/ρ_local` from a VoF.jl simulation), the eddy
+contribution is *added* on top of that field rather than the scalar
+`model.ν₀`. This is the wiring point for combined LES + VoF.
 """
 function update_νt!(s::Smagorinsky, u)
     Cs²Δ² = s.Cs^2 * s.Δ^2
     @inbounds for I in WaterLily.inside(s.ν)
         Sm = WaterLily.S(I, u)
-        # Frobenius norm squared: sum of squared entries.
         s² = sum(abs2, Sm)
         s.ν[I] = s.ν₀ + Cs²Δ² * sqrt(2 * s²)
+    end
+    return s.ν
+end
+function update_νt!(s::Smagorinsky, u, ν₀_field::AbstractArray)
+    Cs²Δ² = s.Cs^2 * s.Δ^2
+    @inbounds for I in WaterLily.inside(s.ν)
+        Sm = WaterLily.S(I, u)
+        s² = sum(abs2, Sm)
+        s.ν[I] = ν₀_field[I] + Cs²Δ² * sqrt(2 * s²)
     end
     return s.ν
 end
@@ -131,28 +145,44 @@ end
 
 """
     update_νt!(model::WALE, u)
+    update_νt!(model::WALE, u, ν₀_field::AbstractArray)
 
 Refresh the WALE eddy viscosity from the current velocity field `u`.
-Total viscosity `ν₀ + ν_t` is written into `model.ν`.
+Total viscosity `ν₀ + ν_t` is written into `model.ν`. With a per-cell
+`ν₀_field`, the eddy contribution is added on top of that field
+(VoF + LES wiring).
 """
 function update_νt!(w::WALE{T}, u::AbstractArray{Tu}) where {T, Tu}
     Cw²Δ² = w.Cw^2 * w.Δ^2
     D = ndims(u) - 1
     Dim = Val(D)
     @inbounds for I in WaterLily.inside(w.ν)
-        g  = _grad_tensor(Dim, I, u)
-        S  = (g + g') / 2
-        g² = g * g
-        # Sᵈ = sym(g²) - (1/3) I tr(g²)
-        Sd = (g² + g²') / 2 - (tr(g²) / D) * I_identity(D, eltype(g²))
-        SS  = sum(abs2, S)        # = SᵢⱼSᵢⱼ
-        SdSd = sum(abs2, Sd)      # = Sᵈᵢⱼ Sᵈᵢⱼ
-        # ν_t = (Cw Δ)² · (SdSd)^(3/2) / [(SS)^(5/2) + (SdSd)^(5/4)]
-        denom = SS^(2.5) + SdSd^(1.25)
-        νt = denom > 0 ? Cw²Δ² * SdSd^(1.5) / denom : zero(T)
+        νt = _wale_νt(Dim, I, u, Cw²Δ², D)
         w.ν[I] = w.ν₀ + T(νt)
     end
     return w.ν
+end
+function update_νt!(w::WALE{T}, u::AbstractArray{Tu},
+                    ν₀_field::AbstractArray) where {T, Tu}
+    Cw²Δ² = w.Cw^2 * w.Δ^2
+    D = ndims(u) - 1
+    Dim = Val(D)
+    @inbounds for I in WaterLily.inside(w.ν)
+        νt = _wale_νt(Dim, I, u, Cw²Δ², D)
+        w.ν[I] = ν₀_field[I] + T(νt)
+    end
+    return w.ν
+end
+
+@inline function _wale_νt(Dim::Val{D}, I, u, Cw²Δ², ::Int) where D
+    g  = _grad_tensor(Dim, I, u)
+    S  = (g + g') / 2
+    g² = g * g
+    Sd = (g² + g²') / 2 - (tr(g²) / D) * I_identity(D, eltype(g²))
+    SS  = sum(abs2, S)
+    SdSd = sum(abs2, Sd)
+    denom = SS^(2.5) + SdSd^(1.25)
+    return denom > 0 ? Cw²Δ² * SdSd^(1.5) / denom : zero(eltype(g²))
 end
 
 # 2D/3D identity helper (avoid LinearAlgebra.I to keep things scalar

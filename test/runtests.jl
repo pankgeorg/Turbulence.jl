@@ -140,4 +140,49 @@ using StaticArrays
         end
     end
 
+    @testset "Smagorinsky + per-cell ν₀ (VoF integration path)" begin
+        # Background per-cell ν₀: half cells ν₀=1e-3 (water-ish),
+        # half ν₀=1e-5 (air-ish).  After update_νt!(...; ν₀_field),
+        # the eddy contribution should be added on top of each.
+        dims = (16, 16, 8)
+        γ = 0.1f0
+        u = zeros(Float32, (dims .+ 2)..., 3)
+        for I in CartesianIndices((1:dims[1]+2, 1:dims[2]+2, 1:dims[3]+2))
+            u[I, 1] = γ * (I.I[2] - 1.5f0)
+        end
+        ν₀_field = fill(1f-3, dims .+ 2)
+        ν₀_field[:, 1:(dims[2]÷2+1), :] .= 1f-5     # bottom half "air"
+        model = Smagorinsky(dims; Cs=0.17f0, ν₀=0f0)
+        update_νt!(model, u, ν₀_field)
+        # Eddy contribution is the same everywhere (uniform shear).
+        # So ν[I] - ν₀_field[I] should be ~ Cs²·γ for all I.
+        νt_uniform = 0.17f0^2 * γ
+        I_air = CartesianIndex(8, 4, 4)
+        I_water = CartesianIndex(8, 14, 4)
+        @test isapprox(model.ν[I_air]   - ν₀_field[I_air],   νt_uniform; rtol=1e-3)
+        @test isapprox(model.ν[I_water] - ν₀_field[I_water], νt_uniform; rtol=1e-3)
+        @test model.ν[I_water] > model.ν[I_air]    # water side has larger ν
+    end
+
+    @testset "WALE + per-cell ν₀" begin
+        dims = (16, 16, 8)
+        u = zeros(Float32, (dims .+ 2)..., 3)
+        for I in CartesianIndices((1:dims[1]+2, 1:dims[2]+2, 1:dims[3]+2))
+            x = (I.I[1] - 1.5f0) - 8
+            y = (I.I[2] - 1.5f0) - 8
+            u[I, 1] = -0.05f0 * y
+            u[I, 2] = +0.05f0 * x
+        end
+        ν₀_field = fill(0.5f0, dims .+ 2)
+        model = WALE(dims; Cw=0.5f0, ν₀=0f0)
+        update_νt!(model, u, ν₀_field)
+        # Eddy contribution = same as without per-cell ν₀ but starting at 0.5
+        model_ref = WALE(dims; Cw=0.5f0, ν₀=0f0)
+        update_νt!(model_ref, u)
+        for I in WaterLily.inside(model.ν)
+            @test isapprox(model.ν[I] - ν₀_field[I], model_ref.ν[I];
+                           atol=1f-6)
+        end
+    end
+
 end
