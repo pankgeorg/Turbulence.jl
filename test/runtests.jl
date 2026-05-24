@@ -164,6 +164,42 @@ using StaticArrays
         @test model.ν[I_water] > model.ν[I_air]    # water side has larger ν
     end
 
+    @testset "WALE fires on 3D Taylor-Green-like field" begin
+        # The pure-shear and rigid-rotation tests both have Sᵈ=0
+        # (rank-2 trace-free), so they only exercise the denominator.
+        # A 3D Taylor-Green flow has a genuine non-zero Sᵈ everywhere
+        # except at symmetry planes — WALE should produce ν_t > 0 in
+        # the bulk.
+        dims = (16, 16, 16)
+        u = zeros(Float32, (dims .+ 2)..., 3)
+        kx = 2π / dims[1]; ky = 2π / dims[2]; kz = 2π / dims[3]
+        for I in CartesianIndices(u)
+            if I.I[end] > 3; continue; end
+            x = (I.I[1] - 1.5f0)
+            y = (I.I[2] - 1.5f0)
+            z = (I.I[3] - 1.5f0)
+            if I.I[end] == 1
+                u[I] =  sin(kx*x) * cos(ky*y) * cos(kz*z)
+            elseif I.I[end] == 2
+                u[I] = -cos(kx*x) * sin(ky*y) * cos(kz*z)
+            elseif I.I[end] == 3
+                u[I] = 0f0
+            end
+        end
+        model = WALE(dims; Cw=0.5f0, ν₀=0f0)
+        update_νt!(model, u)
+        # ν_t should be strictly positive somewhere in the interior.
+        νt_max = 0f0
+        for I in WaterLily.inside(model.ν)
+            νt_max = max(νt_max, model.ν[I])
+        end
+        @test νt_max > 1f-4
+        # Far from a symmetry plane (interior bulk) the typical ν_t
+        # should be at least ~0.001.
+        νt_mid = model.ν[CartesianIndex(8, 8, 8)]
+        @test νt_mid > 1f-4
+    end
+
     @testset "WALE + per-cell ν₀" begin
         dims = (16, 16, 8)
         u = zeros(Float32, (dims .+ 2)..., 3)
