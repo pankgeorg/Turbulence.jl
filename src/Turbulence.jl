@@ -65,33 +65,36 @@ viscosity `vof.ν = μ/ρ_local` from a VoF.jl simulation), the eddy
 contribution is *added* on top of that field rather than the scalar
 `model.ν₀`. This is the wiring point for combined LES + VoF.
 """
-function update_νt!(s::Smagorinsky, u)
+function update_νt!(s::Smagorinsky{T}, u) where T
     Cs²Δ² = s.Cs^2 * s.Δ^2
-    @inbounds for I in WaterLily.inside(s.ν)
-        Sm = WaterLily.S(I, u)
-        s² = sum(abs2, Sm)
-        s.ν[I] = s.ν₀ + Cs²Δ² * sqrt(2 * s²)
-    end
+    WaterLily.@loop s.ν[I] = s.ν₀ +
+        Cs²Δ² * sqrt(2 * sum(abs2, WaterLily.S(I, u))) over I ∈ WaterLily.inside(s.ν)
     return s.ν
 end
-function update_νt!(s::Smagorinsky, u, ν₀_field::AbstractArray)
+function update_νt!(s::Smagorinsky{T}, u, ν₀_field::AbstractArray) where T
     Cs²Δ² = s.Cs^2 * s.Δ^2
-    @inbounds for I in WaterLily.inside(s.ν)
-        Sm = WaterLily.S(I, u)
-        s² = sum(abs2, Sm)
-        s.ν[I] = ν₀_field[I] + Cs²Δ² * sqrt(2 * s²)
-    end
+    WaterLily.@loop s.ν[I] = ν₀_field[I] +
+        Cs²Δ² * sqrt(2 * sum(abs2, WaterLily.S(I, u))) over I ∈ WaterLily.inside(s.ν)
+    # Ghost cells of s.ν should reflect the underlying ν₀_field, not the
+    # scalar s.ν₀ stored at construction. Without this the wall-bounded
+    # _νf face average would mix s.ν₀ ghost with ν₀_field interior at
+    # the boundary.
+    _copy_ghost!(s.ν, ν₀_field)
     return s.ν
 end
 
 """
-    (model::Smagorinsky)(flow, t; kwargs...)
+    (model::Smagorinsky)(flow, t; ν₀_field=nothing, kwargs...)
 
-`udf`-compatible call: refresh `model.ν` from `flow.u`. The updated
-viscosity is consumed by the next `conv_diff!` call inside
-`mom_step!`.
+`udf`-compatible call: refresh `model.ν` from `flow.u`. Pass
+`ν₀_field` (e.g. `vof.ν`) via kwargs to use it as the per-cell
+background viscosity instead of the scalar `model.ν₀`.
 """
-(s::Smagorinsky)(flow, t; kwargs...) = (update_νt!(s, flow.u); return nothing)
+function (s::Smagorinsky)(flow, t; ν₀_field=nothing, kwargs...)
+    ν₀_field === nothing ? update_νt!(s, flow.u) :
+                            update_νt!(s, flow.u, ν₀_field)
+    return nothing
+end
 
 # ----------------------------------------------------------------------------
 # WALE (Nicoud & Ducros 1999) — wall-adapting eddy viscosity
@@ -139,9 +142,11 @@ function WALE(grid_size::NTuple; Cw::Real=0.5, Δ::Real=1.0,
     WALE{T, typeof(ν)}(T(Cw), T(Δ), T(ν₀), ν)
 end
 
-# Build the velocity-gradient tensor at cell centre, for 2D or 3D.
-@inline _grad_tensor(::Val{2}, I, u) = @SMatrix [∂(i,j,I,u) for i in 1:2, j in 1:2]
-@inline _grad_tensor(::Val{3}, I, u) = @SMatrix [∂(i,j,I,u) for i in 1:3, j in 1:3]
+# Build the velocity-gradient tensor at cell centre. Generic in D so a
+# downstream 1D LES wouldn't dispatch-fail (academic — 1D LES is
+# meaningless, but the error message would be ugly).
+@inline _grad_tensor(::Val{D}, I, u) where D =
+    SMatrix{D,D}(∂(i, j, I, u) for i in 1:D, j in 1:D)
 
 """
     update_νt!(model::WALE, u)
@@ -152,37 +157,39 @@ Total viscosity `ν₀ + ν_t` is written into `model.ν`. With a per-cell
 `ν₀_field`, the eddy contribution is added on top of that field
 (VoF + LES wiring).
 """
-function update_νt!(w::WALE{T}, u::AbstractArray{Tu}) where {T, Tu}
+function update_νt!(w::WALE{T}, u::AbstractArray) where T
     Cw²Δ² = w.Cw^2 * w.Δ^2
-    D = ndims(u) - 1
-    Dim = Val(D)
-    @inbounds for I in WaterLily.inside(w.ν)
-        νt = _wale_νt(Dim, I, u, Cw²Δ², D)
-        w.ν[I] = w.ν₀ + T(νt)
-    end
+    Dim = Val(ndims(u) - 1)
+    WaterLily.@loop w.ν[I] = w.ν₀ +
+        T(_wale_νt(Dim, I, u, Cw²Δ²)) over I ∈ WaterLily.inside(w.ν)
     return w.ν
 end
-function update_νt!(w::WALE{T}, u::AbstractArray{Tu},
-                    ν₀_field::AbstractArray) where {T, Tu}
+function update_νt!(w::WALE{T}, u::AbstractArray,
+                    ν₀_field::AbstractArray) where T
     Cw²Δ² = w.Cw^2 * w.Δ^2
-    D = ndims(u) - 1
-    Dim = Val(D)
-    @inbounds for I in WaterLily.inside(w.ν)
-        νt = _wale_νt(Dim, I, u, Cw²Δ², D)
-        w.ν[I] = ν₀_field[I] + T(νt)
-    end
+    Dim = Val(ndims(u) - 1)
+    WaterLily.@loop w.ν[I] = ν₀_field[I] +
+        T(_wale_νt(Dim, I, u, Cw²Δ²)) over I ∈ WaterLily.inside(w.ν)
+    _copy_ghost!(w.ν, ν₀_field)   # see Smagorinsky H2 comment
     return w.ν
 end
 
-@inline function _wale_νt(Dim::Val{D}, I, u, Cw²Δ², ::Int) where D
+# Symmetrise an SMatrix in-place (returns a fresh SMatrix). Avoids
+# `g + g'` which mixes SMatrix + Adjoint{...,SMatrix} and on some Julia
+# versions promotes to a heap Matrix inside the @inline hot path.
+@inline _sym(g::SMatrix{D,D,T}) where {D,T} =
+    SMatrix{D,D,T}((g[i,j] + g[j,i]) / 2 for i in 1:D, j in 1:D)
+
+@inline function _wale_νt(Dim::Val{D}, I, u, Cw²Δ²) where D
     g  = _grad_tensor(Dim, I, u)
-    S  = (g + g') / 2
+    Te = eltype(g)
+    S  = _sym(g)
     g² = g * g
-    Sd = (g² + g²') / 2 - (tr(g²) / D) * I_identity(D, eltype(g²))
-    SS  = sum(abs2, S)
+    Sd = _sym(g²) - (tr(g²) / Te(D)) * I_identity(D, Te)
+    SS   = sum(abs2, S)
     SdSd = sum(abs2, Sd)
-    denom = SS^(2.5) + SdSd^(1.25)
-    return denom > 0 ? Cw²Δ² * SdSd^(1.5) / denom : zero(eltype(g²))
+    denom = SS^Te(2.5) + SdSd^Te(1.25)
+    return denom > 0 ? Cw²Δ² * SdSd^Te(1.5) / denom : zero(Te)
 end
 
 # 2D/3D identity helper (avoid LinearAlgebra.I to keep things scalar
@@ -193,6 +200,31 @@ end
                        zero(T), one(T), zero(T),
                        zero(T), zero(T), one(T))
 
-(w::WALE)(flow, t; kwargs...) = (update_νt!(w, flow.u); return nothing)
+"""
+    (model::WALE)(flow, t; ν₀_field=nothing, kwargs...)
+
+`udf`-compatible call: refresh `model.ν` from `flow.u`. Pass
+`ν₀_field` (e.g. `vof.ν`) via kwargs for the per-cell background.
+"""
+function (w::WALE)(flow, t; ν₀_field=nothing, kwargs...)
+    ν₀_field === nothing ? update_νt!(w, flow.u) :
+                            update_νt!(w, flow.u, ν₀_field)
+    return nothing
+end
+
+# Copy only the one-cell ghost layer from src to dst. Used after the
+# per-cell-ν₀_field update so the ghosts stay consistent with the
+# underlying field rather than the scalar ν₀ left from construction.
+function _copy_ghost!(dst::AbstractArray{T,D}, src::AbstractArray) where {T,D}
+    sz = size(dst)
+    @inbounds for I in CartesianIndices(dst)
+        is_ghost = false
+        for d in 1:D
+            (I[d] == 1 || I[d] == sz[d]) && (is_ghost = true; break)
+        end
+        is_ghost && (dst[I] = src[I])
+    end
+    return dst
+end
 
 end # module
