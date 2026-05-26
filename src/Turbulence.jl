@@ -142,9 +142,13 @@ function WALE(grid_size::NTuple; Cw::Real=0.5, Δ::Real=1.0,
     WALE{T, typeof(ν)}(T(Cw), T(Δ), T(ν₀), ν)
 end
 
-# Build the velocity-gradient tensor at cell centre. Generic in D so a
-# downstream 1D LES wouldn't dispatch-fail (academic — 1D LES is
-# meaningless, but the error message would be ugly).
+"""
+    _grad_tensor(Val(D), I, u) -> SMatrix{D,D}
+
+Build the velocity-gradient tensor `gᵢⱼ = ∂uᵢ/∂xⱼ` at cell `I`. Generic
+in D (returns a 2×2 in 2D, 3×3 in 3D) so a 1D LES would dispatch
+correctly — the error would otherwise be ugly.
+"""
 @inline _grad_tensor(::Val{D}, I, u) where D =
     SMatrix{D,D}(∂(i, j, I, u) for i in 1:D, j in 1:D)
 
@@ -174,12 +178,24 @@ function update_νt!(w::WALE{T}, u::AbstractArray,
     return w.ν
 end
 
-# Symmetrise an SMatrix in-place (returns a fresh SMatrix). Avoids
-# `g + g'` which mixes SMatrix + Adjoint{...,SMatrix} and on some Julia
-# versions promotes to a heap Matrix inside the @inline hot path.
+"""
+    _sym(g) -> SMatrix
+
+Symmetric part `(g + gᵀ)/2` of an `SMatrix`. Hand-written to avoid the
+`g + g'` form which mixes `SMatrix` + `Adjoint{…,SMatrix}` and (on some
+Julia versions) heap-promotes inside the WALE hot path.
+"""
 @inline _sym(g::SMatrix{D,D,T}) where {D,T} =
     SMatrix{D,D,T}((g[i,j] + g[j,i]) / 2 for i in 1:D, j in 1:D)
 
+"""
+    _wale_νt(Val(D), I, u, Cw²Δ²) -> T
+
+Evaluate the WALE eddy-viscosity formula at cell `I`. Builds the local
+velocity-gradient tensor, computes `Sᵢⱼ` and `Sᵈᵢⱼ`, and returns
+`(Cw·Δ)² · (SdSd)^(3/2) / (SS^(5/2) + SdSd^(5/4))`. Returns `zero(T)`
+when the denominator vanishes (uniform flow).
+"""
 @inline function _wale_νt(Dim::Val{D}, I, u, Cw²Δ²) where D
     g  = _grad_tensor(Dim, I, u)
     Te = eltype(g)
@@ -192,8 +208,13 @@ end
     return denom > 0 ? Cw²Δ² * SdSd^Te(1.5) / denom : zero(Te)
 end
 
-# 2D/3D identity helper (avoid LinearAlgebra.I to keep things scalar
-# inside @SMatrix arithmetic on the WALE hot path).
+"""
+    I_identity(D, T) -> SMatrix{D,D,T}
+
+D×D identity matrix as an `SMatrix{D,D,T}`. Local to avoid pulling in
+`LinearAlgebra.I`, which can lazy-promote inside the WALE hot path.
+Supports D ∈ {2, 3}.
+"""
 @inline I_identity(D::Int, T) = D == 2 ?
         SMatrix{2,2,T}(one(T), zero(T), zero(T), one(T)) :
         SMatrix{3,3,T}(one(T), zero(T), zero(T),
@@ -212,9 +233,14 @@ function (w::WALE)(flow, t; ν₀_field=nothing, kwargs...)
     return nothing
 end
 
-# Copy only the one-cell ghost layer from src to dst. Used after the
-# per-cell-ν₀_field update so the ghosts stay consistent with the
-# underlying field rather than the scalar ν₀ left from construction.
+"""
+    _copy_ghost!(dst, src) -> dst
+
+Copy only the one-cell ghost layer of `dst` from `src`. Used after the
+per-cell-ν₀_field update to keep ghost values consistent with the
+underlying VoF/molecular field rather than the scalar `ν₀` stored at
+construction.
+"""
 function _copy_ghost!(dst::AbstractArray{T,D}, src::AbstractArray) where {T,D}
     sz = size(dst)
     @inbounds for I in CartesianIndices(dst)
