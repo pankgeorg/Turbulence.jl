@@ -170,7 +170,8 @@ it does the same physics).
 | # | Goal                                              | Done when                                              | Status |
 |---|---------------------------------------------------|--------------------------------------------------------|--------|
 | 1 | Smagorinsky working on Taylor–Green               | Layer 1 test passes                                    | ✅     |
-| 2 | Smagorinsky + WALE pass channel395 vs OpenFOAM    | Layer 2 ±5% on u⁺                                      | Smag ✅ (RMS 0.028), WALE implemented + L1 tests; channel395 WALE run pending |
-| 3 | SA implemented + channel395 RANS check            | Layer 2 ±5%                                            | ⛔     |
+| 2 | Smagorinsky + WALE pass channel395 vs OpenFOAM    | Layer 2 ±5% on u⁺                                      | ✅ Smag RMS 0.028, WALE RMS 0.030 (both pass; `RESULTS-channel*.md`) |
+| 3 | SA implemented + channel395 RANS check            | Layer 2 ±5%                                            | ◑ closure ✅ (κ≈0.40, physical ν_t, L1 tests); log-law offset wall-treatment-limited (~17%, BDIM effective-roughness). See `ShipFlow.jl/RESULTS-channel-sa.md` |
 | 4 | k–ω SST implemented + channel395 + backstep       | Layer 2 + Layer 3 pass                                 | ⛔     |
+| — | **BDIM wall function** (unblocks RANS quant.)     | SA channel log-law B-offset within ±10%               | ⛔ new — surfaced by milestone 3; prerequisite for ±5% RANS |
 | 5 | Public release (rename if needed, drop "private") | docs + version 0.1.0                                   | ⛔     |

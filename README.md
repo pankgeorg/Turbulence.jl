@@ -79,13 +79,18 @@ boundary value.
 
 ## Implemented
 
-| Closure | Status | Test |
+| Closure | Status | Validation |
 |---|---|---|
-| Smagorinsky | ✅ standalone, plumbed through VoF | `test/test_smagorinsky.jl` |
-| WALE | ✅ standalone, plumbed through VoF | `test/test_wale.jl` |
-| Spalart–Allmaras (RANS) | ⛔ planned | — |
+| Smagorinsky (LES) | ✅ standalone + VoF | channel395 vs OpenFOAM, RMS 0.028 |
+| WALE (LES) | ✅ standalone + VoF | channel395 vs OpenFOAM, RMS 0.030 |
+| Spalart–Allmaras (RANS) | ✅ one-equation, from AIAA 92-0439 | channel log-law slope κ≈0.40 ✓; absolute offset BDIM-wall-limited (~17%) |
 | k–ω SST (RANS) | ⛔ planned | — |
 | Dynamic Germano | ⛔ planned | — |
+
+RANS quantitative wall-bounded accuracy is currently limited by the
+BDIM wall treatment (the smeared immersed wall acts like effective
+roughness, downshifting the log-law constant). A BDIM wall function is
+the tracked next step — see `PLAN.md` milestones.
 
 ## Limitations
 
