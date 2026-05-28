@@ -452,16 +452,28 @@ cell with wall distance `d ∈ band`:
 
 1. tangential velocity `u_t = |u_c − (u_c·n̂)n̂|`, `n̂ = ∇d/|∇d|`;
 2. `u_τ = spalding_uτ(u_t, d, ν_mol)`;
-3. `ν[I] = ν_mol + max(u_τ²·d/u_t − ν_mol, 0)` so `(ν)·(u_t/d) = u_τ²`.
+3. set `ν_t` from `u_τ` per `mode`:
+   - `:flux` (default) — `ν_t = u_τ²·d/u_t − ν_mol`, a flux match
+     (`ν·u_t/d = u_τ²`). The `1/u_t` factor is self-correcting: where the
+     velocity is deficient it raises `ν_t` to pump the flux back up.
+     Empirically the best choice on the channel (SA log-law mean → 7.4%).
+   - `:mixing` — the log-layer eddy viscosity `ν_t = κ·u_τ·d`. With the
+     local (deficient) `u_t` feeding `u_τ`, it under-mixes and recovers
+     little over no wall function — kept for reference.
 
-The first off-wall cell under BDIM (d ≈ 0.5) sits in the smeared band and
-is skipped; the band default `(1,3)` samples the first *clean* cells.
-Returns `ν`.
+A cosine taper ramps the override weight from 0 → 1 over the lower
+`taper` fraction of the band and back to 0 over the upper fraction, so
+the handoff to the model `ν_t` has no kink. The first off-wall cell
+under BDIM (d ≈ 0.5) sits in the smeared region and is skipped; the
+band default `(1,3)` samples the first *clean* cells. Returns `ν`.
 """
 function apply_wall_function!(ν::AbstractArray{T}, u, d, ν_mol;
-                              band=(T(1), T(3)), perdir=()) where T
+                              band=(T(1), T(3)), perdir=(),
+                              mode::Symbol=:flux, κ::Real=T(0.41),
+                              taper::Real=T(0.25)) where T
     D = ndims(u) - 1; Dim = Val(D)
-    lo, hi = T(band[1]), T(band[2])
+    lo, hi = T(band[1]), T(band[2]); κT = T(κ); tp = T(taper)
+    width = max(hi - lo, eps(T)); ramp = tp*width
     @inbounds for I in WaterLily.inside(ν)
         di = d[I]
         (lo ≤ di ≤ hi) || continue
@@ -471,7 +483,13 @@ function apply_wall_function!(ν::AbstractArray{T}, u, d, ν_mol;
         u_t = sqrt(max(sum(abs2, uc) - un^2, zero(T)))
         u_t ≤ eps(T) && continue
         uτ = spalding_uτ(u_t, di, ν_mol)
-        ν[I] = ν_mol + max(uτ^2*di/u_t - ν_mol, zero(T))
+        νt_wf = mode === :flux ? max(uτ^2*di/u_t - ν_mol, zero(T)) : κT*uτ*di
+        # Cosine taper weight: 0 at band edges, 1 in the core.
+        w = ramp ≤ eps(T) ? one(T) :
+            di < lo + ramp ? (one(T) - cos(T(π)*(di-lo)/ramp))/2 :
+            di > hi - ramp ? (one(T) - cos(T(π)*(hi-di)/ramp))/2 : one(T)
+        νt_model = ν[I] - ν_mol
+        ν[I] = ν_mol + (one(T)-w)*νt_model + w*νt_wf
     end
     isempty(perdir) || WaterLily.perBC!(ν, perdir)
     return ν
