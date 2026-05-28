@@ -6,6 +6,7 @@ using StaticArrays
 using LinearAlgebra: tr
 
 export Smagorinsky, WALE, update_νt!
+export wall_distance, semi_implicit_source!
 
 """
     Smagorinsky(grid_size; Cs=0.17, Δ=1, ν₀=0, T=Float32)
@@ -252,5 +253,7 @@ function _copy_ghost!(dst::AbstractArray{T,D}, src::AbstractArray) where {T,D}
     end
     return dst
 end
+
+include("rans.jl")
 
 end # module

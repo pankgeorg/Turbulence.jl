@@ -221,4 +221,73 @@ using StaticArrays
         end
     end
 
+    # ───────────────────────── RANS infrastructure ─────────────────────────
+
+    @testset "wall_distance from channel SDF" begin
+        # Two-plate channel: sdf(x) = min(y, N_Y - y), positive inside.
+        N = (8, 16, 8); N_Y = N[2]
+        body = WaterLily.AutoBody((x, t) -> min(x[2], N_Y - x[2]))
+        d = wall_distance(body, N; T=Float64)
+        @test size(d) == N .+ 2
+        # Cell-centre y for interior cell j is loc(0, I)[2] = (j - 1.5).
+        # Wall distance there is min(y, N_Y - y), clamped to ≥ floor.
+        for j in 2:N[2]+1
+            y = (j - 1.5)
+            expected = max(min(y, N_Y - y), sqrt(eps(Float64)))
+            I = CartesianIndex(4, j, 4)
+            @test isapprox(d[I], expected; atol=1e-6)
+        end
+        # Distances are strictly positive everywhere (no division blow-up).
+        @test all(>(0), d)
+    end
+
+    @testset "transport! advects a blob at the flow speed" begin
+        # Manufactured solution: a Gaussian scalar in a uniform periodic
+        # stream. transport! gives dφ/dt; forward-Euler the field and
+        # check (a) total ∑φ is conserved, (b) the centroid translates
+        # at the imposed velocity.
+        N = (64, 64); Ng = N .+ 2
+        U = 0.5                      # uniform x-velocity
+        φ = zeros(Float64, Ng); Φ = zeros(Float64, Ng)
+        r = zeros(Float64, Ng)
+        u = zeros(Float64, Ng..., 2); u[:, :, 1] .= U
+        x0 = 24.0; σ = 5.0
+        for I in CartesianIndices(φ)
+            xc = I.I[1] - 1.5
+            φ[I] = exp(-((xc - x0)^2) / (2σ^2))
+        end
+        centroid(f) = sum(I -> (I.I[1]-1.5)*f[I], CartesianIndices(f)) / sum(f)
+        m0 = sum(@view φ[2:end-1, 2:end-1]); c0 = centroid(φ)
+        dt = 0.2; nsteps = 40
+        for _ in 1:nsteps
+            WaterLily.transport!(r, φ, u, Φ; perdir=(1, 2))
+            @. φ += dt * r
+            WaterLily.perBC!(φ, (1, 2))
+        end
+        m1 = sum(@view φ[2:end-1, 2:end-1]); c1 = centroid(φ)
+        # Mass conserved to round-off (periodic, conservative flux form).
+        @test isapprox(m1, m0; rtol=1e-3)
+        # Centroid moved by U·t (allow a little numerical diffusion slip).
+        @test isapprox(c1 - c0, U * dt * nsteps; atol=0.5)
+    end
+
+    @testset "semi_implicit_source! implicit destruction stays positive" begin
+        N = (8, 8); Ng = N .+ 2
+        # Pure destruction, large dt·Dc: an *explicit* update
+        # φ + dt(−Dc·φ) = φ(1 − dt·Dc) goes strongly negative for
+        # dt·Dc > 1; the implicit form φ/(1 + dt·Dc) cannot.
+        φ = fill(1.0, Ng); z = zeros(Ng); Dc = fill(10.0, Ng)
+        semi_implicit_source!(φ, z, z, Dc, 1e3)
+        @test all(>(0), @view φ[2:end-1, 2:end-1])
+        for I in WaterLily.inside(φ)
+            @test isapprox(φ[I], 1.0 / (1 + 1e3*10.0); atol=1e-12)
+        end
+        # With zero destruction, φ⁺ = φ + dt·(adv + P) exactly.
+        φ2 = fill(2.0, Ng); Pp = fill(0.25, Ng); adv = fill(-0.1, Ng)
+        semi_implicit_source!(φ2, adv, Pp, z, 4.0)
+        for I in WaterLily.inside(φ2)
+            @test isapprox(φ2[I], 2.0 + 4.0*(0.25 - 0.1); atol=1e-12)
+        end
+    end
+
 end
