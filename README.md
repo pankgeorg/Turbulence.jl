@@ -83,14 +83,17 @@ boundary value.
 |---|---|---|
 | Smagorinsky (LES) | ✅ standalone + VoF | channel395 vs OpenFOAM, RMS 0.028 |
 | WALE (LES) | ✅ standalone + VoF | channel395 vs OpenFOAM, RMS 0.030 |
-| Spalart–Allmaras (RANS) | ✅ one-equation, from AIAA 92-0439 | channel log-law slope κ≈0.40 ✓; absolute offset BDIM-wall-limited (~17%) |
-| k–ω SST (RANS) | ✅ two-equation, from Menter 1994/2003 | L1: F1/F2 blending, ν_t limiter, ω_wall, positivity; channel/backstep pending (BDIM-wall-limited) |
+| Spalart–Allmaras (RANS) | ✅ one-equation, from AIAA 92-0439 | channel law-of-the-wall **7.4% mean** with the BDIM wall function (<2% outer layer) |
+| k–ω SST (RANS) | ✅ two-equation, from Menter 1994/2003 | channel law-of-the-wall **1.7% mean** via native Menter ω-wall treatment; backstep pending |
+| BDIM wall function | ✅ Spalding ν_t override (`wallfn=true`) | SA-only — recovers the log-law constant the smeared wall downshifts |
 | Dynamic Germano | ⛔ planned | — |
 
-RANS quantitative wall-bounded accuracy is currently limited by the
-BDIM wall treatment (the smeared immersed wall acts like effective
-roughness, downshifting the log-law constant). A BDIM wall function is
-the tracked next step — see `PLAN.md` milestones.
+**Wall treatment note.** The BDIM-smeared wall under-resolves the
+near-wall gradient. SA needs the Spalding wall function
+(`step_sa!(...; wallfn=true)`) to recover the log law; k–ω SST handles
+the BDIM wall *natively* through Menter's `ω_wall` treatment and must
+**not** use the Spalding override (it double-counts). See
+`ShipFlow.jl/RESULTS-channel-{sa,sst}.md`.
 
 ## Limitations
 
