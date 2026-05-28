@@ -383,4 +383,23 @@ using StaticArrays
         @test isapprox(maximum(m.ω), 60*0.1/0.075; rtol=1e-6)
     end
 
+    # ───────────────────────── BDIM wall function ─────────────────────────
+
+    @testset "Spalding u_τ solver round-trips the law of the wall" begin
+        κ = 0.41; B = 5.2; ν = 0.01
+        yp(up) = up + exp(-κ*B)*(exp(κ*up) - 1 - κ*up - (κ*up)^2/2 - (κ*up)^3/6)
+        # For each u⁺ on the universal profile, fabricate (u_t, d) for a
+        # known u_τ and check the solver recovers it.
+        for uτ_true in (0.7, 1.3), up in (1.0, 5.0, 10.0, 16.43, 20.0)
+            y = yp(up); u_t = up*uτ_true; d = y*ν/uτ_true
+            uτ = Turbulence.spalding_uτ(u_t, d, ν)
+            @test isapprox(uτ, uτ_true; rtol=1e-6)
+        end
+        # Non-positive tangential velocity → zero friction velocity.
+        @test Turbulence.spalding_uτ(0.0, 1.0, ν) == 0.0
+        # Viscous-sublayer limit: u_τ → √(ν u_t/d) when y⁺ ≪ 1.
+        u_t = 1e-3; d = 1.0
+        @test isapprox(Turbulence.spalding_uτ(u_t, d, ν), sqrt(ν*u_t/d); rtol=1e-3)
+    end
+
 end

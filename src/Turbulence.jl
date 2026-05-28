@@ -9,6 +9,7 @@ export Smagorinsky, WALE, update_νt!
 export wall_distance, semi_implicit_source!
 export SpalartAllmaras, step_sa!
 export KOmegaSST, step_sst!
+export spalding_uτ, apply_wall_function!
 
 """
     Smagorinsky(grid_size; Cs=0.17, Δ=1, ν₀=0, T=Float32)

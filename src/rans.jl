@@ -187,7 +187,8 @@ with the conservative advection+diffusion from `transport!`, the
 `cb2|∇ν̃|²` term and production lumped as the explicit source, and the
 destruction treated implicitly via [`semi_implicit_source!`](@ref).
 """
-function step_sa!(m::SpalartAllmaras{T}, u::AbstractArray{T}, dt) where T
+function step_sa!(m::SpalartAllmaras{T}, u::AbstractArray{T}, dt;
+                  wallfn::Bool=false, band=(T(1), T(3))) where T
     D = ndims(u) - 1
     νm, σ, κ, cv1 = m.ν_mol, m.σ, m.κ, m.cv1
     cb1, cb2, cw1, cw2, cw3 = m.cb1, m.cb2, m.cw1, m.cw2, m.cw3
@@ -215,6 +216,9 @@ function step_sa!(m::SpalartAllmaras{T}, u::AbstractArray{T}, dt) where T
 
     # Refresh effective viscosity ν = ν_mol + ν̃ fv1.
     WaterLily.@loop m.ν[I] = νm + max(m.ν̃[I], zero(T)) * _sa_fv1(m.ν̃[I], νm, cv1³) over I ∈ CartesianIndices(m.ν)
+    # Optional BDIM wall function: override ν in the wall band so the
+    # diffusive flux carries the Spalding-law wall shear.
+    wallfn && apply_wall_function!(m.ν, u, m.d, νm; band=band, perdir=m.perdir)
     return m.ν
 end
 
@@ -308,7 +312,8 @@ Advance the SST `k` and `ω` fields one step of size `dt` under velocity
 `u`, then refresh `model.ν = ν_mol + ν_t`. Call once per outer step,
 before `sim_step!`.
 """
-function step_sst!(m::KOmegaSST{T}, u::AbstractArray, dt) where T
+function step_sst!(m::KOmegaSST{T}, u::AbstractArray, dt;
+                   wallfn::Bool=false, band=(T(1), T(3))) where T
     D = ndims(u) - 1
     νm = m.ν_mol; a1=m.a1; βstar=m.βstar; σω2=m.σω2
     Dim = Val(D)
@@ -361,10 +366,142 @@ function step_sst!(m::KOmegaSST{T}, u::AbstractArray, dt) where T
     end
     isempty(m.perdir) || (WaterLily.perBC!(m.k, m.perdir); WaterLily.perBC!(m.ω, m.perdir))
 
+    # Optional BDIM wall function: set log-layer k, ω in the wall band so
+    # the recompute below and the next step's transport stay consistent.
+    wallfn && wallfn_kω!(m.k, m.ω, u, m.d, νm, βstar, m.κ; band=band, perdir=m.perdir)
+
     # 6. Refresh effective viscosity ν = ν_mol + ν_t (recompute with new k,ω).
     @inbounds for I in WaterLily.inside(m.ν)
         c = _sst_cell(Dim, I, u, m.k, m.ω, m.d, νm, a1, βstar, σω2)
         m.ν[I] = νm + c.νt
     end
+    # Authoritative momentum-side override of ν in the wall band.
+    wallfn && apply_wall_function!(m.ν, u, m.d, νm; band=band, perdir=m.perdir)
     return m.ν
+end
+
+# ----------------------------------------------------------------------------
+# BDIM wall function (Spalding-law eddy-viscosity override).
+#
+# The BDIM-smeared wall cannot carry the sublayer gradient, so a RANS
+# closure under-predicts the wall shear (log-law constant B downshifts
+# like roughness — see ShipFlow.jl/RESULTS-channel-sa.md). Rather than
+# resolve the sublayer, we impose the correct wall shear: from the
+# off-wall tangential velocity at distance d, solve Spalding's universal
+# profile for u_τ, then override ν_t so (ν+ν_t)(u_t/d) = u_τ².
+# ----------------------------------------------------------------------------
+
+"""
+    spalding_uτ(u_t, d, ν; κ=0.41, B=5.2, itmax=30, tol=1e-8) -> u_τ
+
+Friction velocity from Spalding's law of the wall, given the tangential
+velocity `u_t` at wall distance `d` (molecular viscosity `ν`).
+
+Spalding (1961) is a single implicit formula spanning the viscous
+sublayer, buffer, and log layers:
+
+```
+y⁺ = u⁺ + e^(−κB)[e^(κu⁺) − 1 − κu⁺ − (κu⁺)²/2 − (κu⁺)³/6]
+```
+
+With `y⁺ = d·u_τ/ν` and `u⁺ = u_t/u_τ`, substituting gives a single
+equation `u⁺·y⁺(u⁺) = Re_d`, `Re_d = d·u_t/ν`, monotone in `u⁺`. Solved
+by Newton with an analytic derivative and a regime-aware initial guess
+(viscous `√Re_d` for small `Re_d`, log otherwise). Returns 0 for
+non-positive `u_t`.
+"""
+@inline function spalding_uτ(u_t::T, d, νm; κ=T(0.41), B=T(5.2),
+                             itmax::Int=30, tol=T(1e-8)) where T
+    u_t ≤ zero(T) && return zero(T)
+    Re_d = d * u_t / νm
+    emκB = exp(-κ*B)
+    uplus = Re_d < 100 ? sqrt(Re_d) : (log(Re_d)/κ + B)
+    uplus = max(uplus, eps(T))
+    for _ in 1:itmax
+        ku  = κ*uplus
+        ku2 = ku*ku
+        Bf  = exp(ku) - 1 - ku - ku2/2 - ku2*ku/6      # Spalding bracket
+        Bp  = κ*(exp(ku) - 1 - ku - ku2/2)             # d(Bf)/du⁺
+        g   = uplus^2 + uplus*emκB*Bf - Re_d
+        gp  = 2*uplus + emκB*(Bf + uplus*Bp)
+        Δ   = g/gp
+        uplus = max(uplus - Δ, eps(T))
+        abs(Δ) < tol*uplus && break
+    end
+    return u_t / uplus
+end
+
+# Cell-centred velocity vector (face → cell average) at I.
+@inline function _cell_velocity(::Val{D}, I, u::AbstractArray{T}) where {D,T}
+    @inbounds SVector{D,T}(ntuple(i -> (u[I,i] + u[I+δ(i,I),i]) / 2, D))
+end
+
+# Inward wall normal n̂ = ∇d/|∇d| (d increases away from the wall).
+@inline function _wall_normal(::Val{D}, I, d::AbstractArray{T}) where {D,T}
+    n = _grad_scalar(Val(D), I, d)
+    nn = sqrt(sum(abs2, n))
+    nn < eps(T) ? n : n/nn
+end
+
+"""
+    apply_wall_function!(ν, u, d, ν_mol; band=(1,3), perdir=())
+
+Override the effective viscosity `ν` in the wall-adjacent band so the
+diffusive momentum flux reproduces the Spalding-law wall shear. For each
+cell with wall distance `d ∈ band`:
+
+1. tangential velocity `u_t = |u_c − (u_c·n̂)n̂|`, `n̂ = ∇d/|∇d|`;
+2. `u_τ = spalding_uτ(u_t, d, ν_mol)`;
+3. `ν[I] = ν_mol + max(u_τ²·d/u_t − ν_mol, 0)` so `(ν)·(u_t/d) = u_τ²`.
+
+The first off-wall cell under BDIM (d ≈ 0.5) sits in the smeared band and
+is skipped; the band default `(1,3)` samples the first *clean* cells.
+Returns `ν`.
+"""
+function apply_wall_function!(ν::AbstractArray{T}, u, d, ν_mol;
+                              band=(T(1), T(3)), perdir=()) where T
+    D = ndims(u) - 1; Dim = Val(D)
+    lo, hi = T(band[1]), T(band[2])
+    @inbounds for I in WaterLily.inside(ν)
+        di = d[I]
+        (lo ≤ di ≤ hi) || continue
+        uc = _cell_velocity(Dim, I, u)
+        n̂  = _wall_normal(Dim, I, d)
+        un = sum(uc .* n̂)
+        u_t = sqrt(max(sum(abs2, uc) - un^2, zero(T)))
+        u_t ≤ eps(T) && continue
+        uτ = spalding_uτ(u_t, di, ν_mol)
+        ν[I] = ν_mol + max(uτ^2*di/u_t - ν_mol, zero(T))
+    end
+    isempty(perdir) || WaterLily.perBC!(ν, perdir)
+    return ν
+end
+
+"""
+    wallfn_kω!(k, ω, u, d, ν_mol, βstar, κ; band=(1,3), perdir=())
+
+k–ω wall-function companion to [`apply_wall_function!`](@ref): in the
+wall band, set the log-layer equilibrium values
+`k = u_τ²/√β*` and `ω = u_τ/(√β*·κ·d)` from the Spalding `u_τ`.
+"""
+function wallfn_kω!(k::AbstractArray{T}, ω, u, d, ν_mol, βstar, κ;
+                    band=(T(1), T(3)), perdir=()) where T
+    D = ndims(u) - 1; Dim = Val(D)
+    lo, hi = T(band[1]), T(band[2]); sβ = sqrt(βstar)
+    @inbounds for I in WaterLily.inside(k)
+        di = d[I]
+        (lo ≤ di ≤ hi) || continue
+        uc = _cell_velocity(Dim, I, u)
+        n̂  = _wall_normal(Dim, I, d)
+        un = sum(uc .* n̂)
+        u_t = sqrt(max(sum(abs2, uc) - un^2, zero(T)))
+        u_t ≤ eps(T) && continue
+        uτ = spalding_uτ(u_t, di, ν_mol)
+        k[I] = uτ^2 / sβ
+        ω[I] = uτ / (sβ * κ * di)
+    end
+    if !isempty(perdir)
+        WaterLily.perBC!(k, perdir); WaterLily.perBC!(ω, perdir)
+    end
+    return k, ω
 end
