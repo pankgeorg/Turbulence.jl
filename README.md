@@ -8,12 +8,122 @@
 > CFD codes. Do not rely on this for safety-critical or commercial
 > work without first validating against authoritative sources.
 
-Turbulence closures for [WaterLily.jl](https://github.com/WaterLily-jl/WaterLily.jl).
-WIP. See [PLAN.md](./PLAN.md) for the full design.
+LES sub-grid closures for [WaterLily.jl](https://github.com/WaterLily-jl/WaterLily.jl).
+Two closures are implemented today: **Smagorinsky** (Smagorinsky 1963)
+and **WALE** (Nicoud & Ducros 1999). Each produces a cell-centred
+effective viscosity field that WaterLily's `Flow` consumes through the
+upstream `ν =` hook ([`plan/upstream-hooks`](https://github.com/pankgeorg/WaterLily.jl/tree/plan/upstream-hooks)
+on the fork; see the [foam](https://github.com/pankgeorg/foam) meta-page
+for the broader context).
 
-Working titles (renameable on public release):
-- LES: Smagorinsky, WALE
-- RANS: Spalart–Allmaras, k–ω SST
+The package is part of an eight-package stack:
 
-Built on the upstream WaterLily effective-viscosity hook (see
-[`pankgeorg/WaterLily.jl@plan/upstream-hooks`](https://github.com/pankgeorg/WaterLily.jl/tree/plan/upstream-hooks)).
+| Package | Role |
+|---|---|
+| WaterLily | Cartesian NS + BDIM substrate |
+| **Turbulence.jl** | **LES sub-grid (Smagorinsky, WALE) — this repo** |
+| VoF.jl | MULES free-surface |
+| ShipShapes.jl | Hull SDFs |
+| Propellers.jl | Actuator-disk family |
+| LiftingSurfaces.jl | VLM-resolved rudder + rotor |
+| ShipFlow.jl | Integration scripts |
+| ShipMakie.jl | Makie plot recipes |
+
+## Quick start
+
+```julia
+using WaterLily, Turbulence
+
+dims = (192, 64, 64)
+model = WALE(dims; Cw=0.5f0, ν₀=1f-5)
+
+sim = WaterLily.Simulation(dims, (1f0, 0f0, 0f0), 64f0;
+    T=Float32, ν=model.ν, body=body)
+
+# Hook the closure as a UDF — it refreshes ν from u every step.
+sim_step!(sim; udf=model)
+```
+
+To switch closures, swap the model constructor:
+
+```julia
+model = Smagorinsky(dims; Cs=0.17f0, ν₀=1f-5)
+```
+
+## VoF + LES coupling
+
+When you combine LES with a free-surface VoF flow, the molecular ν is
+already per-cell (water vs air). Pass `vof.ν` as the background and the
+eddy contribution is added on top:
+
+```julia
+using WaterLily, VoF, Turbulence
+
+vof   = VoFFlow(dims; α₀=initial_α, ρ_w=10.0, ρ_a=1.0, μ_w=μw, μ_a=μa)
+turb  = WALE(dims; Cw=0.5, ν₀=0.0)        # ν₀ unused, vof.ν is the base
+sim   = Simulation(dims, uBC, L; ν=turb.ν, body=hull, ...)
+
+for step in 1:N
+    WaterLily.mom_step!(sim.flow, sim.pois; pois_tol=1e-8)
+    step_vof!(vof, sim; dt=sim.flow.Δt[end-1])
+    update_νt!(turb, sim.flow.u, vof.ν)   # ← eddy on top of vof.ν
+end
+```
+
+The `update_νt!(model, u, ν₀_field)` form is the wiring point for
+combined LES + VoF. Ghost cells of `model.ν` are copied from
+`ν₀_field` so that `Flow._νf` (face viscosity) sees a consistent
+boundary value.
+
+## Implemented
+
+| Closure | Status | Test |
+|---|---|---|
+| Smagorinsky | ✅ standalone, plumbed through VoF | `test/test_smagorinsky.jl` |
+| WALE | ✅ standalone, plumbed through VoF | `test/test_wale.jl` |
+| Spalart–Allmaras (RANS) | ⛔ planned | — |
+| k–ω SST (RANS) | ⛔ planned | — |
+| Dynamic Germano | ⛔ planned | — |
+
+## Limitations
+
+- **No wall functions.** Both closures rely on the WaterLily BDIM kernel
+  for the wall boundary; near-wall ν_t scaling is approximate. WALE
+  recovers the correct y³ behaviour analytically (its design goal), but
+  is not a substitute for a y+-aware wall model at high Re.
+- **Cell-centred only.** Face-centred eddy viscosity is interpolated
+  inside `WaterLily.Flow._νf`. For shear-aligned grids that's fine; for
+  highly anisotropic cells the interpolation introduces second-order
+  error.
+- **No buoyancy / stratification term.** Single-fluid or VoF flows
+  only; no Brunt-Väisälä-modified eddy viscosity.
+- **No backscatter / dynamic Cs.** Both closures are eddy-viscosity
+  only — they only dissipate, never produce. Real LES backscatter is a
+  separate dynamic-coefficient family that isn't implemented.
+
+## Performance
+
+WALE is the more expensive closure (builds a 3×3 gradient tensor per
+cell), but the cost is still tiny next to the Poisson solve. On a
+192×64×64 single-thread Julia 1.12 run, `update_νt!(WALE, u, vof.ν)`
+takes ~6 ms per step versus ~1500 ms for the full WaterLily momentum
+step.
+
+## Tests
+
+```bash
+julia --project=. -e 'using Pkg; Pkg.test()'
+```
+
+Currently 18 tests covering:
+
+- Both closures vanish in uniform flow (`ν_t = 0`).
+- WALE produces zero `ν_t` in pure shear (its defining property), but
+  Smagorinsky produces non-zero `ν_t` there.
+- WALE has the correct y³ wall-scaling on a Couette-flow profile.
+- `update_νt!(model, u, ν₀_field)` correctly composes with a per-cell
+  background.
+
+## License
+
+MIT.
