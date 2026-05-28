@@ -84,7 +84,7 @@ boundary value.
 | Smagorinsky (LES) | ✅ standalone + VoF | channel395 vs OpenFOAM, RMS 0.028 |
 | WALE (LES) | ✅ standalone + VoF | channel395 vs OpenFOAM, RMS 0.030 |
 | Spalart–Allmaras (RANS) | ✅ one-equation, from AIAA 92-0439 | channel log-law slope κ≈0.40 ✓; absolute offset BDIM-wall-limited (~17%) |
-| k–ω SST (RANS) | ⛔ planned | — |
+| k–ω SST (RANS) | ✅ two-equation, from Menter 1994/2003 | L1: F1/F2 blending, ν_t limiter, ω_wall, positivity; channel/backstep pending (BDIM-wall-limited) |
 | Dynamic Germano | ⛔ planned | — |
 
 RANS quantitative wall-bounded accuracy is currently limited by the
