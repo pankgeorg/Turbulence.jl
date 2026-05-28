@@ -290,4 +290,47 @@ using StaticArrays
         end
     end
 
+    # ───────────────────────── Spalart–Allmaras ─────────────────────────
+
+    @testset "SA fv1 viscous function limits" begin
+        νm = 1e-3; cv1³ = 7.1^3
+        # χ → 0: fv1 → 0 (laminar sublayer, ν_t suppressed)
+        @test Turbulence._sa_fv1(1e-8, νm, cv1³) < 1e-6
+        # χ → ∞: fv1 → 1 (ν_t → ν̃ in the fully turbulent limit)
+        @test isapprox(Turbulence._sa_fv1(1e6*νm, νm, cv1³), 1.0; atol=1e-3)
+        # χ = cv1: fv1 = cv1³/(cv1³+cv1³) = 1/2 exactly
+        @test isapprox(Turbulence._sa_fv1(7.1*νm, νm, cv1³), 0.5; atol=1e-6)
+        # negative ν̃ clamps to 0 → fv1 = 0
+        @test Turbulence._sa_fv1(-1.0, νm, cv1³) == 0.0
+    end
+
+    @testset "SA: zero ν̃ gives laminar ν, stays put" begin
+        N = (12, 20, 8); N_Y = N[2]
+        body = WaterLily.AutoBody((x,t)->min(x[2], N_Y - x[2]))
+        m = SpalartAllmaras(N, body; ν=1e-3, ν̃∞=0.0, perdir=(1,3), T=Float64)
+        u = zeros(Float64, (N .+ 2)..., 3)   # quiescent
+        step_sa!(m, u, 0.1)
+        # ν̃ seeded at 0, no production in still fluid → ν stays molecular
+        @test all(isapprox.(m.ν, 1e-3; atol=1e-9))
+    end
+
+    @testset "SA: turbulent ν̃ grows ν_t monotonically with shear" begin
+        N = (12, 24, 8); N_Y = N[2]
+        body = WaterLily.AutoBody((x,t)->min(x[2], N_Y - x[2]))
+        function run_shear(γ)
+            m = SpalartAllmaras(N, body; ν=1e-3, ν̃∞=3e-3, perdir=(1,3), T=Float64)
+            u = zeros(Float64, (N .+ 2)..., 3)
+            for I in CartesianIndices((1:N[1]+2,1:N[2]+2,1:N[3]+2))
+                y = I.I[2] - 1.5
+                u[I,1] = γ * min(y, N_Y - y)
+            end
+            for _ in 1:40; step_sa!(m, u, 0.05); end
+            (maximum(m.ν) - 1e-3) / 1e-3      # peak ν_t/ν_mol
+        end
+        low  = run_shear(0.05)
+        high = run_shear(0.20)
+        @test high > low            # stronger shear → more eddy viscosity
+        @test low ≥ 0 && isfinite(high)
+    end
+
 end
