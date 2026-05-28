@@ -84,6 +84,17 @@ end
     @inbounds SVector{D,T}(ntuple(j -> (φ[I+δ(j,I)] - φ[I-δ(j,I)]) / 2, D))
 end
 
+# Strain-rate magnitude S = √(2 Sᵢⱼ Sᵢⱼ), S = symmetric part of ∇u.
+@inline function _strain_mag(::Val{D}, I, u::AbstractArray{T}) where {D,T}
+    g = _grad_tensor(Val(D), I, u)
+    s = zero(T)
+    @inbounds for i in 1:D, j in 1:D
+        sij = (g[i,j] + g[j,i]) / 2
+        s += sij*sij
+    end
+    return sqrt(2s)
+end
+
 # SA viscous function fv1 = χ³/(χ³+cv1³), χ = ν̃/ν.
 @inline function _sa_fv1(ν̃::T, νm, cv1³) where T
     χ³ = (max(ν̃, zero(T)) / νm)^3
@@ -204,5 +215,156 @@ function step_sa!(m::SpalartAllmaras{T}, u::AbstractArray{T}, dt) where T
 
     # Refresh effective viscosity ν = ν_mol + ν̃ fv1.
     WaterLily.@loop m.ν[I] = νm + max(m.ν̃[I], zero(T)) * _sa_fv1(m.ν̃[I], νm, cv1³) over I ∈ CartesianIndices(m.ν)
+    return m.ν
+end
+
+# ----------------------------------------------------------------------------
+# Menter k–ω SST (Menter 1994; Menter, Kuntz & Langtry 2003).
+# Implemented from the papers, not from any OpenFOAM source.
+# Two transported scalars k, ω with the F1/F2 blending and the ν_t limiter.
+# ----------------------------------------------------------------------------
+
+# F1 blending argument and value at a cell (eddy viscosity = a1 k / max(a1 ω, S F2)).
+# Returns (F1, F2). d is wall distance, S strain magnitude, νm molecular ν.
+@inline function _sst_blend(k::T, ω::T, d, S, νm, βstar, σω2,
+                            gradk, gradω) where T
+    k = max(k, zero(T)); ω = max(ω, eps(T))
+    d² = d*d
+    sqrtk = sqrt(k)
+    CDkω = max(2*σω2/ω * sum(gradk .* gradω), T(1e-10))
+    a1arg = max(sqrtk/(βstar*ω*d), 500*νm/(d²*ω))
+    arg1 = min(a1arg, 4*σω2*k/(CDkω*d²))
+    F1 = tanh(arg1^4)
+    arg2 = max(2*sqrtk/(βstar*ω*d), 500*νm/(d²*ω))
+    F2 = tanh(arg2^2)
+    return F1, F2, CDkω
+end
+
+"""
+    KOmegaSST(grid_size, body; ν=1e-5, k∞, ω∞, perdir=(), T=Float64, mem=Array)
+
+Menter k–ω SST two-equation RANS model. Transports turbulent kinetic
+energy `k` and specific dissipation `ω`; the eddy viscosity is
+`ν_t = a1 k / max(a1 ω, S F2)` and `ν = ν_mol + ν_t` is written into the
+field passed to `Flow(...; ν=model.ν)`.
+
+`T` defaults to **Float64** because `ω` spans many orders of magnitude
+near the wall (the model's stiffest field).
+
+Step once per outer time step with [`step_sst!`](@ref) before `sim_step!`.
+
+Constants (Menter 2003): a1=0.31, β*=0.09, κ=0.41; inner (k–ω) set
+σk1=0.85, σω1=0.5, β1=0.075; outer (k–ε) set σk2=1.0, σω2=0.856,
+β2=0.0828; γ = β/β* − σω κ²/√β* per set.
+"""
+struct KOmegaSST{T, A<:AbstractArray{T}}
+    k::A; ω::A; ν::A; d::A
+    Φ::A; rk::A; rω::A; Pk::A; Sωe::A; Dck::A; Dcω::A
+    Ddk::A; Ddω::A; νt::A; F1::A
+    ν_mol::T; k∞::T; ω∞::T; perdir::Tuple
+    a1::T; βstar::T; κ::T
+    σk1::T; σω1::T; β1::T; γ1::T
+    σk2::T; σω2::T; β2::T; γ2::T
+end
+
+function KOmegaSST(grid_size::NTuple{D}, body;
+                   ν::Real=1e-5, k∞::Real=1e-4, ω∞::Real=1.0, perdir=(),
+                   T::Type=Float64, mem=Array) where D
+    Ng = grid_size .+ 2
+    mk() = zeros(T, Ng) |> mem
+    k = fill(T(k∞), Ng) |> mem
+    ω = fill(T(ω∞), Ng) |> mem
+    νf = fill(T(ν), Ng) |> mem
+    d  = wall_distance(body, grid_size; T=T, mem=mem)
+    a1=T(0.31); βstar=T(0.09); κ=T(0.41)
+    σk1=T(0.85); σω1=T(0.5); β1=T(0.075)
+    σk2=T(1.0);  σω2=T(0.856); β2=T(0.0828)
+    γ1 = β1/βstar - σω1*κ^2/sqrt(βstar)
+    γ2 = β2/βstar - σω2*κ^2/sqrt(βstar)
+    KOmegaSST{T,typeof(k)}(k, ω, νf, d,
+        mk(),mk(),mk(),mk(),mk(),mk(),mk(),mk(),mk(),mk(),mk(),
+        T(ν), T(k∞), T(ω∞), Tuple(perdir),
+        a1, βstar, κ, σk1, σω1, β1, γ1, σk2, σω2, β2, γ2)
+end
+
+# Per-cell SST closure: returns everything the source assembly needs.
+@inline function _sst_cell(::Val{D}, I, u, k_arr::AbstractArray{T}, ω_arr, d_arr,
+                           νm, a1, βstar, σω2) where {D,T}
+    k = max(k_arr[I], zero(T)); ω = max(ω_arr[I], eps(T))
+    S = _strain_mag(Val(D), I, u)
+    gradk = _grad_scalar(Val(D), I, k_arr)
+    gradω = _grad_scalar(Val(D), I, ω_arr)
+    d = @inbounds d_arr[I]
+    F1, F2, CDkω = _sst_blend(k, ω, d, S, νm, βstar, σω2, gradk, gradω)
+    νt = a1*k / max(a1*ω, S*F2)
+    νt = clamp(νt, zero(T), T(1e5)*νm)
+    return (S=S, F1=F1, νt=νt, gradk=gradk, gradω=gradω)
+end
+
+"""
+    step_sst!(model::KOmegaSST, u, dt)
+
+Advance the SST `k` and `ω` fields one step of size `dt` under velocity
+`u`, then refresh `model.ν = ν_mol + ν_t`. Call once per outer step,
+before `sim_step!`.
+"""
+function step_sst!(m::KOmegaSST{T}, u::AbstractArray, dt) where T
+    D = ndims(u) - 1
+    νm = m.ν_mol; a1=m.a1; βstar=m.βstar; σω2=m.σω2
+    Dim = Val(D)
+
+    # 1. Blending, ν_t (lagged), diffusion coefficients. Store F1, νt.
+    @inbounds for I in WaterLily.inside(m.k)
+        c = _sst_cell(Dim, I, u, m.k, m.ω, m.d, νm, a1, βstar, σω2)
+        m.F1[I] = c.F1; m.νt[I] = c.νt
+        σk = c.F1*m.σk1 + (1-c.F1)*m.σk2
+        σω = c.F1*m.σω1 + (1-c.F1)*m.σω2
+        m.Ddk[I] = νm + σk*c.νt
+        m.Ddω[I] = νm + σω*c.νt
+    end
+    WaterLily.perBC!(m.Ddk, m.perdir); WaterLily.perBC!(m.Ddω, m.perdir)
+
+    # 2. Conservative advection + diffusion for each scalar.
+    WaterLily.transport!(m.rk, m.k, u, m.Φ; D_diff=m.Ddk, perdir=m.perdir)
+    WaterLily.transport!(m.rω, m.ω, u, m.Φ; D_diff=m.Ddω, perdir=m.perdir)
+
+    # 3. Source terms (production limited; destruction implicit; ω cross-diffusion).
+    @inbounds for I in WaterLily.inside(m.k)
+        c = _sst_cell(Dim, I, u, m.k, m.ω, m.d, νm, a1, βstar, σω2)
+        kI = max(m.k[I], zero(T)); ωI = max(m.ω[I], eps(T))
+        β  = c.F1*m.β1 + (1-c.F1)*m.β2
+        γ  = c.F1*m.γ1 + (1-c.F1)*m.γ2
+        Pk = c.νt * c.S^2
+        Pk = min(Pk, 10*βstar*kI*ωI)                  # production limiter
+        # k: production explicit, β*·k·ω destruction implicit (Dc=β*·ω)
+        m.Pk[I]  = Pk
+        m.Dck[I] = βstar*ωI
+        # ω: (γ/νt)Pk + cross-diffusion explicit; β·ω² implicit (Dc=β·ω)
+        crossdiff = 2*(1-c.F1)*σω2/ωI * sum(c.gradk .* c.gradω)
+        νt_safe = max(c.νt, eps(T))
+        m.Sωe[I] = γ/νt_safe * Pk + crossdiff
+        m.Dcω[I] = β*ωI
+    end
+
+    # 4. Positivity-preserving semi-implicit update.
+    semi_implicit_source!(m.k, m.rk, m.Pk, m.Dck, dt)
+    semi_implicit_source!(m.ω, m.rω, m.Sωe, m.Dcω, dt)
+
+    # 5. Clamp positivity, enforce wall ω (Menter ω_wall = 60ν/(β1 d₁²)),
+    #    periodic BCs.
+    ωwall = 60νm / (m.β1 * T(1.0)^2)      # first off-wall cell ≈ 1 cell from wall
+    @inbounds for I in WaterLily.inside(m.k)
+        m.k[I] = max(m.k[I], zero(T))
+        m.ω[I] = max(m.ω[I], eps(T))
+        # Strong ω near the wall: where d ≤ 1.5 cells, clamp up to ω_wall.
+        m.d[I] ≤ T(1.5) && (m.ω[I] = max(m.ω[I], ωwall))
+    end
+    isempty(m.perdir) || (WaterLily.perBC!(m.k, m.perdir); WaterLily.perBC!(m.ω, m.perdir))
+
+    # 6. Refresh effective viscosity ν = ν_mol + ν_t (recompute with new k,ω).
+    @inbounds for I in WaterLily.inside(m.ν)
+        c = _sst_cell(Dim, I, u, m.k, m.ω, m.d, νm, a1, βstar, σω2)
+        m.ν[I] = νm + c.νt
+    end
     return m.ν
 end

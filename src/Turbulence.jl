@@ -8,6 +8,7 @@ using LinearAlgebra: tr
 export Smagorinsky, WALE, update_νt!
 export wall_distance, semi_implicit_source!
 export SpalartAllmaras, step_sa!
+export KOmegaSST, step_sst!
 
 """
     Smagorinsky(grid_size; Cs=0.17, Δ=1, ν₀=0, T=Float32)

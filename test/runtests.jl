@@ -333,4 +333,54 @@ using StaticArrays
         @test low ≥ 0 && isfinite(high)
     end
 
+    # ───────────────────────────── k–ω SST ─────────────────────────────
+
+    @testset "SST F1 blending: 1 near wall, →0 far from wall" begin
+        νm = 1e-3; βstar = 0.09; σω2 = 0.856
+        k = 0.1; ω = 100.0
+        g0 = SVector(0.0, 0.0)                 # zero scalar gradients
+        # Deep in the near-wall layer (very small d) the 500ν/(d²ω) term
+        # dominates and F1, F2 → 1 (inner k–ω constants).
+        F1n, F2n, _ = Turbulence._sst_blend(k, ω, 0.05, 10.0, νm, βstar, σω2, g0, g0)
+        @test F1n > 0.99
+        @test F2n > 0.99
+        # Far from the wall (large d): F1 → 0 (outer k–ε constants).
+        F1f, _, _ = Turbulence._sst_blend(k, ω, 1e4, 10.0, νm, βstar, σω2, g0, g0)
+        @test F1f < 0.01
+        # F1 is monotone decreasing in wall distance.
+        Fa,_,_ = Turbulence._sst_blend(k, ω, 1.0, 10.0, νm, βstar, σω2, g0, g0)
+        Fb,_,_ = Turbulence._sst_blend(k, ω, 5.0, 10.0, νm, βstar, σω2, g0, g0)
+        @test Fa ≥ Fb
+    end
+
+    @testset "SST ν_t limiter caps at a1 k /(S F2)" begin
+        # In a high-strain region S F2 > a1 ω, so ν_t = a1 k/(S F2) < k/ω.
+        a1 = 0.31; k = 0.5; ω = 1.0; S = 100.0; F2 = 1.0
+        νt_lim = a1*k / max(a1*ω, S*F2)
+        @test νt_lim ≈ a1*k/(S*F2)
+        @test νt_lim < k/ω                     # limiter active
+        # In low strain, the limiter is inactive → ν_t = k/ω.
+        S2 = 0.0
+        νt_free = a1*k / max(a1*ω, S2*F2)
+        @test νt_free ≈ k/ω
+    end
+
+    @testset "SST: stable + positive, applies ω_wall" begin
+        N = (12, 24); N_Y = N[2]
+        body = WaterLily.AutoBody((x,t)->min(x[2], N_Y - x[2]))
+        m = KOmegaSST(N, body; ν=0.1, k∞=1e-3, ω∞=1.0, perdir=(1,), T=Float64)
+        u = zeros(Float64, (N .+ 2)..., 2)
+        for I in CartesianIndices((1:N[1]+2, 1:N[2]+2))
+            y = I.I[2] - 1.5
+            u[I, 1] = 0.4 * min(y, N_Y - y)
+        end
+        for _ in 1:60; step_sst!(m, u, 0.02); end
+        @test all(isfinite, m.k) && all(isfinite, m.ω) && all(isfinite, m.ν)
+        @test all(≥(0), m.k)
+        @test all(>(0), m.ω)
+        @test all(m.ν .≥ 0.1 - 1e-9)           # ν ≥ ν_mol
+        # Wall ω value: 60ν/(β1·d₁²) with d₁≈1 → 60·0.1/0.075 = 80.
+        @test isapprox(maximum(m.ω), 60*0.1/0.075; rtol=1e-6)
+    end
+
 end
