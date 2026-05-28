@@ -31,5 +31,15 @@ jobs:
           version: ${{ matrix.version }}
           arch: ${{ matrix.arch }}
       - uses: julia-actions/cache@v2
+      # Turbulence.jl tests use the per-cell ν Hook 1 from the fork
+      # (upstream-pr-hooks branch, awaiting upstream PR-290 merge).
+      - name: Install WaterLily from fork branch
+        run: |
+          rm -f Manifest.toml
+          julia --project=. -e '
+            using Pkg
+            Pkg.add(Pkg.PackageSpec(url="https://github.com/pankgeorg/WaterLily.jl", rev="upstream-pr-hooks"))
+            Pkg.instantiate()
+          '
       - uses: julia-actions/julia-buildpkg@v1
       - uses: julia-actions/julia-runtest@v1
