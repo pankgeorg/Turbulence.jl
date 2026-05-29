@@ -313,7 +313,7 @@ Advance the SST `k` and `ω` fields one step of size `dt` under velocity
 before `sim_step!`.
 """
 function step_sst!(m::KOmegaSST{T}, u::AbstractArray, dt;
-                   wallfn::Bool=false, band=(T(1), T(3))) where T
+                   wallfn::Bool=false, band=(T(1), T(3)), λ=WaterLily.quick) where T
     D = ndims(u) - 1
     νm = m.ν_mol; a1=m.a1; βstar=m.βstar; σω2=m.σω2
     Dim = Val(D)
@@ -329,9 +329,10 @@ function step_sst!(m::KOmegaSST{T}, u::AbstractArray, dt;
     end
     WaterLily.perBC!(m.Ddk, m.perdir); WaterLily.perBC!(m.Ddω, m.perdir)
 
-    # 2. Conservative advection + diffusion for each scalar.
-    WaterLily.transport!(m.rk, m.k, u, m.Φ; D_diff=m.Ddk, perdir=m.perdir)
-    WaterLily.transport!(m.rω, m.ω, u, m.Φ; D_diff=m.Ddω, perdir=m.perdir)
+    # 2. Conservative advection + diffusion for each scalar (limiter λ;
+    #    less-diffusive λ=vanLeer sharpens free shear layers).
+    WaterLily.transport!(m.rk, m.k, u, m.Φ; D_diff=m.Ddk, perdir=m.perdir, λ=λ)
+    WaterLily.transport!(m.rω, m.ω, u, m.Φ; D_diff=m.Ddω, perdir=m.perdir, λ=λ)
 
     # 3. Source terms (production limited; destruction implicit; ω cross-diffusion).
     @inbounds for I in WaterLily.inside(m.k)
