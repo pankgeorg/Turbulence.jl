@@ -7,7 +7,7 @@
 #      scalars (ν̃ for SA; k, ω for SST), built on WaterLily's `transport!`.
 # ----------------------------------------------------------------------------
 
-using WaterLily: measure_sdf!, AbstractBody, transport!, quick
+using WaterLily: measure_sdf!, AbstractBody
 
 """
     wall_distance(body, grid_size; t=0, T=Float32, mem=Array, dfloor=√eps)
@@ -187,7 +187,7 @@ with the conservative advection+diffusion from `transport!`, the
 `cb2|∇ν̃|²` term and production lumped as the explicit source, and the
 destruction treated implicitly via [`semi_implicit_source!`](@ref).
 """
-function step_sa!(m::SpalartAllmaras{T}, u::AbstractArray{T}, dt;
+function step_sa!(m::SpalartAllmaras{T}, u::AbstractArray, dt;
                   wallfn::Bool=false, band=(T(1), T(3))) where T
     D = ndims(u) - 1
     νm, σ, κ, cv1 = m.ν_mol, m.σ, m.κ, m.cv1
@@ -228,8 +228,8 @@ end
 # Two transported scalars k, ω with the F1/F2 blending and the ν_t limiter.
 # ----------------------------------------------------------------------------
 
-# F1 blending argument and value at a cell (eddy viscosity = a1 k / max(a1 ω, S F2)).
-# Returns (F1, F2). d is wall distance, S strain magnitude, νm molecular ν.
+# SST F1/F2 blending functions at a cell. d is wall distance, S strain
+# magnitude, νm molecular ν; gradk/gradω the cell-centred scalar gradients.
 @inline function _sst_blend(k::T, ω::T, d, S, νm, βstar, σω2,
                             gradk, gradω) where T
     k = max(k, zero(T)); ω = max(ω, eps(T))
@@ -241,7 +241,7 @@ end
     F1 = tanh(arg1^4)
     arg2 = max(2*sqrtk/(βstar*ω*d), 500*νm/(d²*ω))
     F2 = tanh(arg2^2)
-    return F1, F2, CDkω
+    return F1, F2
 end
 
 """
@@ -300,7 +300,7 @@ end
     gradk = _grad_scalar(Val(D), I, k_arr)
     gradω = _grad_scalar(Val(D), I, ω_arr)
     d = @inbounds d_arr[I]
-    F1, F2, CDkω = _sst_blend(k, ω, d, S, νm, βstar, σω2, gradk, gradω)
+    F1, F2 = _sst_blend(k, ω, d, S, νm, βstar, σω2, gradk, gradω)
     νt = a1*k / max(a1*ω, S*F2)
     νt = clamp(νt, zero(T), T(1e5)*νm)
     return (S=S, Ω=Ω, F1=F1, νt=νt, gradk=gradk, gradω=gradω)
@@ -326,18 +326,39 @@ before `sim_step!`.
 function step_sst!(m::KOmegaSST{T}, u::AbstractArray, dt;
                    wallfn::Bool=false, band=(T(1), T(3)), λ=WaterLily.quick,
                    production::Symbol=:standard) where T
+    @assert production in (:standard, :kato_launder) "unknown production $production"
     D = ndims(u) - 1
     νm = m.ν_mol; a1=m.a1; βstar=m.βstar; σω2=m.σω2
     Dim = Val(D)
+    katoL = production === :kato_launder
 
-    # 1. Blending, ν_t (lagged), diffusion coefficients. Store F1, νt.
+    # 1. Blending, ν_t (lagged), diffusion coefficients, and the k/ω source
+    #    terms — all from the current (pre-update) u, k, ω, so a single
+    #    per-cell closure eval covers everything before the transport step.
     @inbounds for I in WaterLily.inside(m.k)
         c = _sst_cell(Dim, I, u, m.k, m.ω, m.d, νm, a1, βstar, σω2)
+        kI = max(m.k[I], zero(T)); ωI = max(m.ω[I], eps(T))
         m.F1[I] = c.F1; m.νt[I] = c.νt
         σk = c.F1*m.σk1 + (1-c.F1)*m.σk2
         σω = c.F1*m.σω1 + (1-c.F1)*m.σω2
         m.Ddk[I] = νm + σk*c.νt
         m.Ddω[I] = νm + σω*c.νt
+        β  = c.F1*m.β1 + (1-c.F1)*m.β2
+        γ  = c.F1*m.γ1 + (1-c.F1)*m.γ2
+        # k production: standard νt·S² or Kato–Launder νt·S·Ω, then limited.
+        Gk = katoL ? c.νt*c.S*c.Ω : c.νt*c.S^2
+        Pk = min(Gk, 10*βstar*kI*ωI)                   # k-equation limiter
+        m.Pk[I]  = Pk
+        m.Dck[I] = βstar*ωI                            # β*·k·ω implicit
+        # ω production γ/νt·P̃k using the *limited* P̃k. Using the limited
+        # production (not the raw γ·S²) bounds ω-production at the sharp
+        # immersed step corner where S is near-singular — this is the
+        # robustness that keeps the BDIM BFS stable; the textbook γ·S²
+        # form diverges there.
+        νt_safe = max(c.νt, eps(T))
+        crossdiff = 2*(1-c.F1)*σω2/ωI * sum(c.gradk .* c.gradω)
+        m.Sωe[I] = γ/νt_safe * Pk + crossdiff
+        m.Dcω[I] = β*ωI                                # β·ω² implicit
     end
     WaterLily.perBC!(m.Ddk, m.perdir); WaterLily.perBC!(m.Ddω, m.perdir)
 
@@ -346,34 +367,13 @@ function step_sst!(m::KOmegaSST{T}, u::AbstractArray, dt;
     WaterLily.transport!(m.rk, m.k, u, m.Φ; D_diff=m.Ddk, perdir=m.perdir, λ=λ)
     WaterLily.transport!(m.rω, m.ω, u, m.Φ; D_diff=m.Ddω, perdir=m.perdir, λ=λ)
 
-    # 3. Source terms (production limited; destruction implicit; ω cross-diffusion).
-    @inbounds for I in WaterLily.inside(m.k)
-        c = _sst_cell(Dim, I, u, m.k, m.ω, m.d, νm, a1, βstar, σω2)
-        kI = max(m.k[I], zero(T)); ωI = max(m.ω[I], eps(T))
-        β  = c.F1*m.β1 + (1-c.F1)*m.β2
-        γ  = c.F1*m.γ1 + (1-c.F1)*m.γ2
-        # Production: standard P_k = νt·S² or Kato–Launder P_k = νt·S·Ω
-        # (the latter suppresses spurious production where strain ≫
-        # vorticity, e.g. the reattachment stagnation region).
-        Pk = production === :kato_launder ? c.νt * c.S * c.Ω : c.νt * c.S^2
-        Pk = min(Pk, 10*βstar*kI*ωI)                  # production limiter
-        # k: production explicit, β*·k·ω destruction implicit (Dc=β*·ω)
-        m.Pk[I]  = Pk
-        m.Dck[I] = βstar*ωI
-        # ω: (γ/νt)Pk + cross-diffusion explicit; β·ω² implicit (Dc=β·ω)
-        crossdiff = 2*(1-c.F1)*σω2/ωI * sum(c.gradk .* c.gradω)
-        νt_safe = max(c.νt, eps(T))
-        m.Sωe[I] = γ/νt_safe * Pk + crossdiff
-        m.Dcω[I] = β*ωI
-    end
-
-    # 4. Positivity-preserving semi-implicit update.
+    # 3. Positivity-preserving semi-implicit update.
     semi_implicit_source!(m.k, m.rk, m.Pk, m.Dck, dt)
     semi_implicit_source!(m.ω, m.rω, m.Sωe, m.Dcω, dt)
 
-    # 5. Clamp positivity, enforce wall ω (Menter ω_wall = 60ν/(β1 d₁²)),
+    # 4. Clamp positivity, enforce wall ω (Menter ω_wall = 60ν/(β1 d₁²)),
     #    periodic BCs.
-    ωwall = 60νm / (m.β1 * T(1.0)^2)      # first off-wall cell ≈ 1 cell from wall
+    ωwall = 60νm / m.β1                    # Menter 60ν/(β1·d₁²) with d₁≈1 cell
     @inbounds for I in WaterLily.inside(m.k)
         m.k[I] = max(m.k[I], zero(T))
         m.ω[I] = max(m.ω[I], eps(T))
@@ -386,7 +386,7 @@ function step_sst!(m::KOmegaSST{T}, u::AbstractArray, dt;
     # the recompute below and the next step's transport stay consistent.
     wallfn && wallfn_kω!(m.k, m.ω, u, m.d, νm, βstar, m.κ; band=band, perdir=m.perdir)
 
-    # 6. Refresh effective viscosity ν = ν_mol + ν_t (recompute with new k,ω).
+    # 5. Refresh effective viscosity ν = ν_mol + ν_t (recompute with new k,ω).
     @inbounds for I in WaterLily.inside(m.ν)
         c = _sst_cell(Dim, I, u, m.k, m.ω, m.d, νm, a1, βstar, σω2)
         m.ν[I] = νm + c.νt
@@ -487,6 +487,7 @@ function apply_wall_function!(ν::AbstractArray{T}, u, d, ν_mol;
                               band=(T(1), T(3)), perdir=(),
                               mode::Symbol=:flux, κ::Real=T(0.41),
                               taper::Real=T(0.25)) where T
+    @assert mode in (:flux, :mixing) "unknown wall-function mode $mode"
     D = ndims(u) - 1; Dim = Val(D)
     lo, hi = T(band[1]), T(band[2]); κT = T(κ); tp = T(taper)
     width = max(hi - lo, eps(T)); ramp = tp*width

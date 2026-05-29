@@ -341,15 +341,15 @@ using StaticArrays
         g0 = SVector(0.0, 0.0)                 # zero scalar gradients
         # Deep in the near-wall layer (very small d) the 500ν/(d²ω) term
         # dominates and F1, F2 → 1 (inner k–ω constants).
-        F1n, F2n, _ = Turbulence._sst_blend(k, ω, 0.05, 10.0, νm, βstar, σω2, g0, g0)
+        F1n, F2n = Turbulence._sst_blend(k, ω, 0.05, 10.0, νm, βstar, σω2, g0, g0)
         @test F1n > 0.99
         @test F2n > 0.99
         # Far from the wall (large d): F1 → 0 (outer k–ε constants).
-        F1f, _, _ = Turbulence._sst_blend(k, ω, 1e4, 10.0, νm, βstar, σω2, g0, g0)
+        F1f, _ = Turbulence._sst_blend(k, ω, 1e4, 10.0, νm, βstar, σω2, g0, g0)
         @test F1f < 0.01
         # F1 is monotone decreasing in wall distance.
-        Fa,_,_ = Turbulence._sst_blend(k, ω, 1.0, 10.0, νm, βstar, σω2, g0, g0)
-        Fb,_,_ = Turbulence._sst_blend(k, ω, 5.0, 10.0, νm, βstar, σω2, g0, g0)
+        Fa, _ = Turbulence._sst_blend(k, ω, 1.0, 10.0, νm, βstar, σω2, g0, g0)
+        Fb, _ = Turbulence._sst_blend(k, ω, 5.0, 10.0, νm, βstar, σω2, g0, g0)
         @test Fa ≥ Fb
     end
 
