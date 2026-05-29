@@ -383,6 +383,37 @@ using StaticArrays
         @test isapprox(maximum(m.ω), 60*0.1/0.075; rtol=1e-6)
     end
 
+    @testset "SST Kato–Launder production: equals standard in pure shear" begin
+        N = (16, 16); N_Y = N[2]
+        body = WaterLily.AutoBody((x,t)->min(x[2], N_Y - x[2]))
+        # Pure shear u_x(y)=γy: |S| = |Ω| = γ/√2·… equal magnitudes, so
+        # P_k = νt·S² and νt·S·Ω coincide → the two production forms give
+        # the same k,ω evolution and ν field.
+        function run(prod)
+            m = KOmegaSST(N, body; ν=0.05, k∞=1e-3, ω∞=1.0, perdir=(1,), T=Float64)
+            u = zeros(Float64, (N .+ 2)..., 2)
+            for I in CartesianIndices((1:N[1]+2, 1:N[2]+2))
+                u[I,1] = 0.3 * (I.I[2] - 1.5)
+            end
+            for _ in 1:30; step_sst!(m, u, 0.02; production=prod); end
+            copy(m.ν)
+        end
+        @test maximum(abs.(run(:standard) .- run(:kato_launder))) < 1e-9
+        # Irrotational strain (Ω=0): Kato–Launder kills production where
+        # standard would not — they must differ. u=(x, -y) ⇒ pure strain.
+        N2 = (16,16); body2 = WaterLily.AutoBody((x,t)->min(x[2],16-x[2]))
+        ms = KOmegaSST(N2, body2; ν=0.05, k∞=1e-3, ω∞=1.0, T=Float64)
+        mk = KOmegaSST(N2, body2; ν=0.05, k∞=1e-3, ω∞=1.0, T=Float64)
+        u2 = zeros(Float64, (N2 .+ 2)..., 2)
+        for I in CartesianIndices((1:18,1:18))
+            x = I.I[1]-1.5; y = I.I[2]-1.5
+            u2[I,1] = 0.1*x; u2[I,2] = -0.1*y      # ∇·u=0, Ω=0, S≠0
+        end
+        step_sst!(ms, u2, 0.05; production=:standard)
+        step_sst!(mk, u2, 0.05; production=:kato_launder)
+        @test maximum(abs.(ms.ν .- mk.ν)) > 0      # strain-dominated ⇒ differ
+    end
+
     # ───────────────────────── BDIM wall function ─────────────────────────
 
     @testset "Spalding u_τ solver round-trips the law of the wall" begin

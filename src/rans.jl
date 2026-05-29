@@ -296,24 +296,36 @@ end
                            νm, a1, βstar, σω2) where {D,T}
     k = max(k_arr[I], zero(T)); ω = max(ω_arr[I], eps(T))
     S = _strain_mag(Val(D), I, u)
+    Ω = _vorticity_mag(Val(D), I, u)      # for the Kato–Launder production option
     gradk = _grad_scalar(Val(D), I, k_arr)
     gradω = _grad_scalar(Val(D), I, ω_arr)
     d = @inbounds d_arr[I]
     F1, F2, CDkω = _sst_blend(k, ω, d, S, νm, βstar, σω2, gradk, gradω)
     νt = a1*k / max(a1*ω, S*F2)
     νt = clamp(νt, zero(T), T(1e5)*νm)
-    return (S=S, F1=F1, νt=νt, gradk=gradk, gradω=gradω)
+    return (S=S, Ω=Ω, F1=F1, νt=νt, gradk=gradk, gradω=gradω)
 end
 
 """
-    step_sst!(model::KOmegaSST, u, dt)
+    step_sst!(model::KOmegaSST, u, dt; wallfn=false, band=(1,3),
+              λ=quick, production=:standard)
 
 Advance the SST `k` and `ω` fields one step of size `dt` under velocity
 `u`, then refresh `model.ν = ν_mol + ν_t`. Call once per outer step,
 before `sim_step!`.
+
+- `λ` — advection limiter for the k/ω transport (`quick`, `vanLeer`, `cds`).
+- `production` — turbulent-production form: `:standard` (`P_k = νt·S²`,
+  baseline SST) or `:kato_launder` (`P_k = νt·S·Ω`). Kato–Launder
+  suppresses spurious production where strain dominates vorticity
+  (stagnation/reattachment regions); it is identical to standard in pure
+  shear (S = Ω). Opt-in — not baseline SST.
+- `wallfn` — apply the Spalding wall function (SA-style; SST has a native
+  ω-wall treatment and normally should *not* use this).
 """
 function step_sst!(m::KOmegaSST{T}, u::AbstractArray, dt;
-                   wallfn::Bool=false, band=(T(1), T(3)), λ=WaterLily.quick) where T
+                   wallfn::Bool=false, band=(T(1), T(3)), λ=WaterLily.quick,
+                   production::Symbol=:standard) where T
     D = ndims(u) - 1
     νm = m.ν_mol; a1=m.a1; βstar=m.βstar; σω2=m.σω2
     Dim = Val(D)
@@ -340,7 +352,10 @@ function step_sst!(m::KOmegaSST{T}, u::AbstractArray, dt;
         kI = max(m.k[I], zero(T)); ωI = max(m.ω[I], eps(T))
         β  = c.F1*m.β1 + (1-c.F1)*m.β2
         γ  = c.F1*m.γ1 + (1-c.F1)*m.γ2
-        Pk = c.νt * c.S^2
+        # Production: standard P_k = νt·S² or Kato–Launder P_k = νt·S·Ω
+        # (the latter suppresses spurious production where strain ≫
+        # vorticity, e.g. the reattachment stagnation region).
+        Pk = production === :kato_launder ? c.νt * c.S * c.Ω : c.νt * c.S^2
         Pk = min(Pk, 10*βstar*kI*ωI)                  # production limiter
         # k: production explicit, β*·k·ω destruction implicit (Dc=β*·ω)
         m.Pk[I]  = Pk
